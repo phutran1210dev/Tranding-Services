@@ -13,29 +13,47 @@ dotenv.config();
 @Injectable()
 export class TradingService {
   private readonly logger = new Logger(TradingService.name);
-  private readonly symbol = process.env.SYMBOL || 'BTCUSDT';
-  private readonly depositAmount = 100;
-  private readonly margin = parseInt(process.env.DEFAULT_MARGIN) || 25;
-  private lastAction = '';
-  private entryPrice = 0;
-  private tradeInProgress = false;
-  private pnlInterval: NodeJS.Timeout;
-  private tradeStartTime: number;
-  private priceHistory: Array<{ time: string; price: number }> = [];
+  private readonly symbols = ['DOGEUSDT'];
+  private readonly depositAmount = 10;
+  private readonly margin = parseInt(process.env.DEFAULT_MARGIN) || 30;
 
-  private winCount = 0;
-  private lossCount = 0;
-  private totalProfitLoss = 0;
-  private consecutiveTrades = 0; // Track consecutive trades to limit to max 1-2
+  private tradeStates = new Map<string, {
+    size: number;
+    entryPrice: number;
+    breakEvenPrice: number;
+    markPrice: number;
+    liqPrice: number;
+    marginRatio: number;
+    pnlRoiPercent: number;
+    tradeInProgress: boolean;
+    pnlInterval: NodeJS.Timeout;
+    priceHistory: Array<{ time: string; price: number }>;
+    tradeHistory: Array<{ time: string; pnlAmount: number; pnlPercent: number }>;
+  }>();
 
   constructor(
-    @InjectModel(Trade.name) private tradeModel: Model<TradeDocument>
+    @InjectModel(Trade.name) private tradeModel: Model<TradeDocument>,
   ) {
+    this.symbols.forEach(symbol => {
+      this.tradeStates.set(symbol, {
+        size: 0,
+        entryPrice: 0,
+        breakEvenPrice: 0,
+        markPrice: 0,
+        liqPrice: 0,
+        marginRatio: 0,
+        pnlRoiPercent: 0,
+        tradeInProgress: false,
+        pnlInterval: null,
+        priceHistory: [],
+        tradeHistory: [],
+      });
+    });
     this.startTrading();
   }
 
-  async getCandles() {
-    const url = `https://api.binance.com/api/v3/klines?symbol=${this.symbol}&interval=15m&limit=50`;
+  async getCandles(symbol: string) {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=50`;
     const { data } = await axios.get(url);
     return data.map(candle => ({
       openTime: candle[0],
@@ -43,8 +61,8 @@ export class TradingService {
     }));
   }
 
-  async calculateEMA() {
-    const candles = await this.getCandles();
+  async calculateEMA(symbol: string) {
+    const candles = await this.getCandles(symbol);
     const closes = candles.map(candle => candle.close);
 
     const ema12 = technicalindicators.EMA.calculate({ period: 12, values: closes });
@@ -54,142 +72,73 @@ export class TradingService {
     return { ema12, ema26, ema200, latestClose: closes[closes.length - 1] };
   }
 
-  async trade() {
-    const { ema12, ema26, ema200, latestClose } = await this.calculateEMA();
+  async trade(symbol: string) {
+    const { ema12, ema26, latestClose } = await this.calculateEMA(symbol);
     const latestEMA12 = ema12[ema12.length - 1];
     const latestEMA26 = ema26[ema26.length - 1];
-    const latestEMA200 = ema200[ema200.length - 1];
 
-    // Determine signals and limit to 1-2 consecutive trades per signal type
-    const isBuySignal = latestEMA12 > latestEMA26 && this.lastAction !== 'BUY' && this.consecutiveTrades < 2;
-    const isSellSignal = latestEMA12 < latestEMA26 && this.lastAction !== 'SELL' && this.consecutiveTrades < 2;
+    const tradeState = this.tradeStates.get(symbol);
+    if (!tradeState) return;
 
-    if (!this.tradeInProgress) {
-      if (isBuySignal) {
-        await this.executeTrade('BUY', latestClose, latestEMA200);
-      } else if (isSellSignal) {
-        await this.executeTrade('SELL', latestClose, latestEMA200);
-      }
+    const isBuySignal = latestEMA12 > latestEMA26 && !tradeState.tradeInProgress;
+    const isSellSignal = latestEMA12 < latestEMA26 && tradeState.tradeInProgress;
+
+    if (isBuySignal) {
+      await this.executeTrade(symbol, 'BUY', latestClose);
+    } else if (isSellSignal) {
+      await this.executeTrade(symbol, 'SELL', latestClose);
     }
 
-    this.logPrice(latestClose);
+    this.updateTradeDetails(symbol, latestClose);
+    this.logTradeSummary();
   }
 
-  async executeTrade(action: 'BUY' | 'SELL', latestClose: number, ema200: number) {
-    this.entryPrice = latestClose;
-    this.tradeInProgress = true;
-    this.lastAction = action;
-    this.tradeStartTime = Date.now();
-    this.consecutiveTrades++; // Increment consecutive trade count for the current action
+  async executeTrade(symbol: string, action: 'BUY' | 'SELL', price: number) {
+    const tradeState = this.tradeStates.get(symbol);
+    if (!tradeState) return;
 
-    // Calculate SL and TP
-    const slPercentage = 0.015 + Math.random() * 0.015; // Random SL between 1.5% - 3%
-    const stopLoss = action === 'BUY'
-      ? Math.min(ema200, this.entryPrice * (1 - slPercentage))
-      : Math.max(ema200, this.entryPrice * (1 + slPercentage));
-    const riskToRewardRatio = 2; // R:R of 1:2
-    const takeProfit = action === 'BUY'
-      ? this.entryPrice * (1 + slPercentage * riskToRewardRatio)
-      : this.entryPrice * (1 - slPercentage * riskToRewardRatio);
+    tradeState.entryPrice = price;
+    tradeState.size = this.depositAmount * this.margin / price;
+    tradeState.tradeInProgress = true;
 
-    this.logger.log(`🔔 ${action === 'BUY' ? 'Vào lệnh MUA' : 'Vào lệnh BÁN'} tại giá: ${this.entryPrice}, SL: ${stopLoss}, TP: ${takeProfit}`);
+    const slPercentage = 0.015 + Math.random() * 0.015;
+    tradeState.liqPrice = action === 'BUY'
+      ? tradeState.entryPrice * (1 - slPercentage)
+      : tradeState.entryPrice * (1 + slPercentage);
 
-    await this.saveTrade(action, this.entryPrice, takeProfit, stopLoss);
-    this.monitorPnL(takeProfit, stopLoss);
+    tradeState.marginRatio = 0; // Can calculate based on dynamic market conditions
+    tradeState.pnlRoiPercent = 0;
   }
 
-  async saveTrade(action: string, entryPrice: number, takeProfit: number, stopLoss: number) {
-    const newTrade = new this.tradeModel({
-      symbol: this.symbol,
-      action,
-      entryPrice,
-      depositAmount: this.depositAmount,
-      margin: this.margin,
-      takeProfit,
-      stopLoss,
-      timestamp: new Date(),
-    });
-    await newTrade.save();
-    this.logger.log('✅ Giao dịch đã được lưu vào MongoDB');
-  }
+  updateTradeDetails(symbol: string, latestClose: number) {
+    const tradeState = this.tradeStates.get(symbol);
+    if (!tradeState || !tradeState.tradeInProgress) return;
 
-  async monitorPnL(takeProfit: number, stopLoss: number) {
-    if (this.pnlInterval) {
-      clearInterval(this.pnlInterval);
-    }
-
-    this.pnlInterval = setInterval(async () => {
-      const { latestClose } = await this.calculateEMA();
-      const pnlPercent = ((latestClose - this.entryPrice) / this.entryPrice) * 100 * this.margin;
-      const pnlAmount = (pnlPercent / 100) * this.depositAmount;
-
-      this.logger.log(
-        `💰 Giá hiện tại: ${latestClose} | Giá vào lệnh: ${this.entryPrice} | Lợi nhuận: ${pnlPercent.toFixed(2)}% | Lợi nhuận/Lỗ: ${pnlAmount.toFixed(2)} USDT`
-      );
-
-      const tradeDuration = (Date.now() - this.tradeStartTime) / 1000 / 60;
-      if (tradeDuration >= 15 || latestClose >= takeProfit || latestClose <= stopLoss) {
-        clearInterval(this.pnlInterval);
-        this.closeTrade(pnlAmount, pnlPercent);
-      }
-    }, 30000);
-  }
-
-  async closeTrade(pnlAmount: number, pnlPercent: number) {
-    this.tradeInProgress = false;
-    const result = pnlAmount >= 0 ? 'THẮNG' : 'THUA';
-
-    const closedTrade = new this.tradeModel({
-      symbol: this.symbol,
-      action: this.lastAction,
-      entryPrice: this.entryPrice,
-      depositAmount: this.depositAmount,
-      margin: this.margin,
-      profitLossAmount: pnlAmount,
-      profitLossPercent: pnlPercent,
-      result,
-      timestamp: new Date(),
-    });
-    await closedTrade.save();
-
-    // Update state and log result
-    this.lastAction = '';
-    this.entryPrice = 0;
-    this.consecutiveTrades = 0; // Reset consecutive trade counter
-    result === 'THẮNG' ? this.winCount++ : this.lossCount++;
-    this.totalProfitLoss += pnlAmount;
-
-    this.logger.log(`🔒 Đóng lệnh với kết quả: ${result} | Lợi nhuận/Lỗ: ${pnlAmount.toFixed(2)} USDT`);
-
-    const totalTrades = this.winCount + this.lossCount;
-    const winRate = (this.winCount / totalTrades) * 100;
-    console.clear();
-    console.table([
-      {
-        'Số lệnh thắng': this.winCount,
-        'Số lệnh thua': this.lossCount,
-        'Tỷ lệ thắng (%)': winRate.toFixed(2),
-        'Tổng lợi nhuận/lỗ (USDT)': this.totalProfitLoss.toFixed(2),
-      },
-    ]);
-  }
-
-  async logPrice(currentPrice: number) {
-    const timestamp = new Date().toLocaleTimeString();
-    this.priceHistory.push({ time: timestamp, price: currentPrice });
-
-    if (this.priceHistory.length > 60) {
-      this.priceHistory.shift();
-    }
-
-    console.clear();
-    this.logger.log('Giá theo phút:');
-    console.table(this.priceHistory);
+    tradeState.markPrice = latestClose;
+    tradeState.pnlRoiPercent = ((latestClose - tradeState.entryPrice) / tradeState.entryPrice) * 100;
+    tradeState.marginRatio = tradeState.pnlRoiPercent * 0.75; // Example formula
   }
 
   async startTrading() {
     setInterval(async () => {
-      await this.trade();
-    }, 900000); // Run every 15 minutes to match the candle closing time
+      for (const symbol of this.symbols) {
+        await this.trade(symbol);
+      }
+    }, 5000);
+  }
+
+  logTradeSummary() {
+    const summaryTable = Array.from(this.tradeStates.values()).map(state => ({
+      Symbol: this.symbols[0],
+      Size: state.size.toFixed(2),
+      EntryPrice: state.entryPrice.toFixed(2),
+      MarkPrice: state.markPrice.toFixed(2),
+      LiqPrice: state.liqPrice.toFixed(2),
+      MarginRatio: `${state.marginRatio.toFixed(2)}%`,
+      Margin: this.margin,
+      PNL_ROI: `${state.pnlRoiPercent.toFixed(2)}%`
+    }));
+    console.clear();
+    console.table(summaryTable);
   }
 }
